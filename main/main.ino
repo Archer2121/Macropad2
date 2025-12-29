@@ -1,149 +1,146 @@
 #include <WiFi.h>
 #include <WebServer.h>
-#include <DNSServer.h>
-#include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
 #include <USB.h>
 #include <USBHIDKeyboard.h>
-#include <Preferences.h>
 
-#define BTN1 2
-#define BTN2 4
+#define BTN1_PIN 2
+#define BTN2_PIN 4
 #define LED_PIN 48
-#define LED_COUNT 1
+
+#define FW_VERSION "1.0.0"
 
 USBHIDKeyboard Keyboard;
-Adafruit_NeoPixel pixel(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel pixel(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
-DNSServer dns;
 Preferences prefs;
 
-bool otaEnabled = false;
-unsigned long otaStart = 0;
+// ---------------- LED STATES ----------------
+enum LedMode {
+  LED_BOOT,
+  LED_WIFI,
+  LED_READY,
+  LED_BTN1,
+  LED_BTN2,
+  LED_OTA,
+  LED_ERROR
+};
 
-String fwVersion = "1.0.1";
-const char* apName = "Macropad-Setup";
+LedMode ledMode = LED_BOOT;
+uint32_t lastBlink = 0;
+bool blinkState = false;
 
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body { background:#111;color:#fff;font-family:sans-serif;text-align:center }
-button { padding:12px;margin:6px;font-size:16px }
-</style>
-</head>
-<body>
-<h2>Macropad</h2>
-<button onclick="fetch('/ota')">Enable OTA (60s)</button>
-<p id="v"></p>
-<script>
-fetch('/version').then(r=>r.text()).then(t=>v.innerText='Firmware '+t)
-</script>
-</body>
-</html>
-)rawliteral";
+// ---------------- MACROS ----------------
+String macro1 = "CTRL+ALT+DEL";
+String macro2 = "WIN+D";
 
-void startCaptivePortal() {
-  WiFi.softAP(apName);
-  dns.start(53, "*", WiFi.softAPIP());
+// ---------------- LED HANDLER ----------------
+void updateLED() {
+  if (millis() - lastBlink < 300) return;
+  lastBlink = millis();
+  blinkState = !blinkState;
 
-  server.onNotFound([]() {
-    server.send(200, "text/html", INDEX_HTML);
+  uint32_t c = 0;
+  switch (ledMode) {
+    case LED_BOOT: c = pixel.Color(0, 0, 50); break;
+    case LED_WIFI: c = blinkState ? pixel.Color(50, 40, 0) : 0; break;
+    case LED_READY: c = pixel.Color(10, 10, 10); break;
+    case LED_BTN1: c = pixel.Color(0, 50, 0); break;
+    case LED_BTN2: c = pixel.Color(0, 50, 50); break;
+    case LED_OTA: c = blinkState ? pixel.Color(40, 0, 40) : 0; break;
+    case LED_ERROR: c = blinkState ? pixel.Color(50, 0, 0) : 0; break;
+  }
+  pixel.setPixelColor(0, c);
+  pixel.show();
+}
+
+// ---------------- SEND KEYS ----------------
+void sendMacro(String macro) {
+  macro.toUpperCase();
+  if (macro.indexOf("CTRL") >= 0) Keyboard.press(KEY_LEFT_CTRL);
+  if (macro.indexOf("ALT") >= 0) Keyboard.press(KEY_LEFT_ALT);
+  if (macro.indexOf("SHIFT") >= 0) Keyboard.press(KEY_LEFT_SHIFT);
+  if (macro.indexOf("WIN") >= 0) Keyboard.press(KEY_LEFT_GUI);
+
+  char key = macro.charAt(macro.length() - 1);
+  Keyboard.press(key);
+  delay(50);
+  Keyboard.releaseAll();
+}
+
+// ---------------- WEB UI ----------------
+void setupWeb() {
+  server.on("/", []() {
+    server.send(200, "text/html",
+      "<h2>Macropad</h2>"
+      "<p>Firmware " FW_VERSION "</p>"
+    );
+  });
+
+  server.on("/set", []() {
+    macro1 = server.arg("m1");
+    macro2 = server.arg("m2");
+    prefs.putString("m1", macro1);
+    prefs.putString("m2", macro2);
+    server.send(200, "text/plain", "Saved");
   });
 
   server.begin();
 }
 
-void connectWiFi() {
-  prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", "");
-  String pass = prefs.getString("pass", "");
-  prefs.end();
-
-  if (ssid.isEmpty()) {
-    startCaptivePortal();
-    return;
-  }
-
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    startCaptivePortal();
-    return;
-  }
-
-  MDNS.begin("macropad");
-
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-}
-
+// ---------------- SETUP ----------------
 void setup() {
-  Serial.begin(115200);
-  delay(300);
-
-  pinMode(BTN1, INPUT_PULLUP);
-  pinMode(BTN2, INPUT_PULLUP);
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
 
   pixel.begin();
   pixel.setBrightness(40);
+  ledMode = LED_BOOT;
 
-  connectWiFi();
+  prefs.begin("macros");
+  macro1 = prefs.getString("m1", macro1);
+  macro2 = prefs.getString("m2", macro2);
 
-  ArduinoOTA.setHostname("macropad");
-
-  server.on("/", []() {
-    server.send(200, "text/html", INDEX_HTML);
-  });
-
-  server.on("/version", []() {
-    server.send(200, "text/plain", fwVersion);
-  });
-
-  server.on("/ota", []() {
-    otaEnabled = true;
-    otaStart = millis();
-    ArduinoOTA.begin();   // OTA ONLY STARTS HERE
-    server.send(200, "text/plain", "OTA enabled for 60 seconds");
-  });
-
-  server.begin();
-
-  delay(1500);           // 🔑 ESP32-S3 stability delay
-  USB.begin();
   Keyboard.begin();
+  USB.begin();
 
-  Serial.println("BOOT OK");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  ledMode = LED_WIFI;
+
+  if (WiFi.waitForConnectResult() == WL_CONNECTED) {
+    ledMode = LED_READY;
+    setupWeb();
+  } else {
+    ledMode = LED_ERROR;
+  }
+
+  ArduinoOTA
+    .onStart([]() { ledMode = LED_OTA; })
+    .onEnd([]() { ledMode = LED_READY; });
+
+  ArduinoOTA.begin();
 }
 
+// ---------------- LOOP ----------------
 void loop() {
+  ArduinoOTA.handle();
   server.handleClient();
-  dns.processNextRequest();
+  updateLED();
 
-  if (otaEnabled) {
-    ArduinoOTA.handle();
-    if (millis() - otaStart > 60000) {
-      otaEnabled = false;
-      ArduinoOTA.end();
-    }
+  if (!digitalRead(BTN1_PIN)) {
+    ledMode = LED_BTN1;
+    sendMacro(macro1);
+    delay(300);
+    ledMode = LED_READY;
   }
 
-  static uint8_t hue = 0;
-  pixel.setPixelColor(0, pixel.ColorHSV(hue++ * 256));
-  pixel.show();
-
-  if (!digitalRead(BTN1)) {
-    Keyboard.press(KEY_LEFT_CTRL);
-    Keyboard.press('c');
-    delay(50);
-    Keyboard.releaseAll();
+  if (!digitalRead(BTN2_PIN)) {
+    ledMode = LED_BTN2;
+    sendMacro(macro2);
     delay(300);
-  }
-
-  if (!digitalRead(BTN2)) {
-    Keyboard.print("Hello World");
-    delay(300);
+    ledMode = LED_READY;
   }
 }
